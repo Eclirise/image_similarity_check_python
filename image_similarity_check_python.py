@@ -57,6 +57,10 @@ except Exception:
 APP_NAME = "图片相似度工作台"
 APP_VERSION = "2026 Desktop Studio Light · Compare Pro"
 VALID_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff", ".gif"}
+PIP_INDEX_CANDIDATES = [
+    "https://pypi.tuna.tsinghua.edu.cn/simple",
+    "https://pypi.org/simple",
+]
 
 StatusCallback = Optional[Callable[[str], None]]
 ProgressCallback = Optional[Callable[[int, int, str], None]]
@@ -287,6 +291,48 @@ def default_model_cache_dir() -> Path:
     return Path.home() / '.image_similarity_workbench' / 'hf_cache'
 
 
+def install_runtime_dependencies(
+    requirements_file: Path,
+    status_cb: StatusCallback = None,
+) -> str:
+    if not requirements_file.exists():
+        raise FileNotFoundError(f"未找到依赖清单：{requirements_file}")
+    last_error = None
+    for index_url in PIP_INDEX_CANDIDATES:
+        emit_status(status_cb, f"正在安装依赖…\n源：{index_url}")
+        cmd = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "pip",
+        ]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        except Exception:
+            pass
+        cmd = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "-r",
+            str(requirements_file),
+            "-i",
+            index_url,
+            "--prefer-binary",
+            "--disable-pip-version-check",
+        ]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            return index_url
+        except Exception as e:
+            last_error = e
+            emit_status(status_cb, f"依赖源安装失败，准备尝试下一源：{index_url}\n原因：{e}")
+    raise RuntimeError(f"依赖安装失败。已尝试源：{', '.join(PIP_INDEX_CANDIDATES)}；最后错误：{last_error}")
+
+
 def get_hf_endpoint_candidates(mirror_mode: str = 'auto', custom_endpoint: str = '') -> List[str]:
     if custom_endpoint.strip():
         return [custom_endpoint.strip()]
@@ -473,6 +519,9 @@ def build_records(
                 pretrained=clip_pretrained,
                 batch_size=batch_size,
                 device=device,
+                mirror_mode=clip_mirror,
+                custom_endpoint=clip_endpoint,
+                model_cache_dir=model_cache_dir,
                 status_cb=status_cb,
                 progress_cb=progress_cb,
             )
@@ -1380,6 +1429,10 @@ def launch_gui_mode(base_args: argparse.Namespace) -> None:
         from PIL import ImageTk
     except Exception as e:
         raise SystemExit(f"图形界面依赖不可用：{e}")
+    try:
+        import ttkbootstrap as ttkb  # type: ignore
+    except Exception:
+        ttkb = None  # type: ignore
 
     class ZoomPreviewPane:
         def __init__(self, parent, side: str, bg: str, border: str, text_color: str, muted: str, accent: str, view_change_callback) -> None:
@@ -1953,6 +2006,7 @@ def launch_gui_mode(base_args: argparse.Namespace) -> None:
 
         def __init__(self, root: tk.Tk, args: argparse.Namespace) -> None:
             self.root = root
+            self.using_ttkbootstrap = ttkb is not None
             self.base_args = args
             self.queue: queue.Queue = queue.Queue()
             self.job_running = False
@@ -1972,6 +2026,7 @@ def launch_gui_mode(base_args: argparse.Namespace) -> None:
             self.compare_window: Optional[CompareReviewWindow] = None
             self._configure_window()
             self._configure_style()
+            self._build_menubar()
             self._build_layout()
             if not self._closing:
                 self.root.after(80, self._poll_queue)
@@ -1995,10 +2050,11 @@ def launch_gui_mode(base_args: argparse.Namespace) -> None:
 
         def _configure_style(self) -> None:
             style = ttk.Style(self.root)
-            try:
-                style.theme_use("clam")
-            except Exception:
-                pass
+            if not self.using_ttkbootstrap:
+                try:
+                    style.theme_use("clam")
+                except Exception:
+                    pass
 
             font_main = ("Microsoft YaHei UI", 13)
             font_bold = ("Microsoft YaHei UI", 13, "bold")
@@ -2102,6 +2158,29 @@ def launch_gui_mode(base_args: argparse.Namespace) -> None:
             style.map("Treeview", background=[("selected", self.SELECT)], foreground=[("selected", self.TEXT)])
             self.root.option_add("*Font", font_main)
 
+        def _build_menubar(self) -> None:
+            menubar = tk.Menu(self.root, tearoff=0)
+            file_menu = tk.Menu(menubar, tearoff=0)
+            file_menu.add_command(label="一键检查并安装依赖", command=self._start_dependency_install)
+            file_menu.add_separator()
+            file_menu.add_command(label="退出", command=self._on_close)
+            menubar.add_cascade(label="文件", menu=file_menu)
+
+            view_menu = tk.Menu(menubar, tearoff=0)
+            view_menu.add_command(label="打开全屏双图对比 (F11)", command=self._open_compare_window)
+            menubar.add_cascade(label="视图", menu=view_menu)
+
+            tool_menu = tk.Menu(menubar, tearoff=0)
+            tool_menu.add_command(label="切换到双目录对比", command=lambda: self.notebook.select(0) if hasattr(self, "notebook") else None)
+            tool_menu.add_command(label="切换到参考图检索", command=lambda: self.notebook.select(1) if hasattr(self, "notebook") else None)
+            tool_menu.add_command(label="切换到目录扫描", command=lambda: self.notebook.select(2) if hasattr(self, "notebook") else None)
+            menubar.add_cascade(label="工具", menu=tool_menu)
+
+            help_menu = tk.Menu(menubar, tearoff=0)
+            help_menu.add_command(label="关于", command=lambda: messagebox.showinfo("关于", f"{APP_NAME}\n{APP_VERSION}\n\n专注图片相似检索、复核与清理。"))
+            menubar.add_cascade(label="帮助", menu=help_menu)
+            self.root.configure(menu=menubar)
+
         def _build_layout(self) -> None:
             outer = ttk.Frame(self.root)
             outer.pack(fill="both", expand=True, padx=20, pady=20)
@@ -2109,7 +2188,8 @@ def launch_gui_mode(base_args: argparse.Namespace) -> None:
             header = ttk.Frame(outer)
             header.pack(fill="x")
             ttk.Label(header, text=APP_NAME, style="Title.TLabel").pack(side="left")
-            ttk.Label(header, text="大字版 · 防误触 · 本地桌面工作台", style="Muted.TLabel").pack(side="left", padx=(14, 0), pady=(8, 0))
+            ttk.Label(header, text="全中文 · 本地桌面工作台 · 高流畅双图复核", style="Muted.TLabel").pack(side="left", padx=(14, 0), pady=(8, 0))
+            ttk.Button(header, text="一键安装依赖", style="Tool.TButton", command=self._start_dependency_install).pack(side="right")
 
             status_bar = ttk.Frame(outer, style="Surface.TFrame")
             status_bar.pack(fill="x", pady=(16, 14))
@@ -2290,6 +2370,28 @@ def launch_gui_mode(base_args: argparse.Namespace) -> None:
                     emit("done", result=result, activity_key=activity_key)
 
             threading.Thread(target=runner, daemon=True).start()
+
+        def _start_dependency_install(self) -> None:
+            requirements_file = Path(__file__).with_name("requirements.txt")
+            if self.job_running:
+                messagebox.showinfo("任务进行中", "当前已有任务在运行，请等待完成后再执行依赖检查。")
+                return
+
+            def worker(emit):
+                status = lambda msg: emit("status", message=msg, activity_key="scan")
+                used_index = install_runtime_dependencies(requirements_file=requirements_file, status_cb=status)
+                return {"used_index": used_index, "requirements": str(requirements_file)}
+
+            def done(result):
+                self.status_var.set("依赖安装完成，可直接开始工作。")
+                self.summary_var.set("依赖已就绪")
+                self._append_activity("scan", f"依赖安装完成，使用源：{result['used_index']}")
+                messagebox.showinfo(
+                    "依赖安装完成",
+                    f"依赖已安装完成。\n\n依赖文件：{result['requirements']}\n安装源：{result['used_index']}",
+                )
+
+            self._start_job(worker, done, [], "scan")
 
         def _finish_job(self) -> None:
             self.job_running = False
@@ -3111,7 +3213,10 @@ def launch_gui_mode(base_args: argparse.Namespace) -> None:
             self._append_activity("compare", f"已导出复核报告：{path}")
             messagebox.showinfo("导出完成", f"复核报告已导出：\n\n{path}")
 
-    root = tk.Tk()
+    if ttkb is not None:
+        root = ttkb.Window(themename="litera")
+    else:
+        root = tk.Tk()
     StudioApp(root, base_args)
     root.mainloop()
 
