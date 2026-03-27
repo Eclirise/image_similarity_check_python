@@ -5,5 +5,3 @@ scipy>=1.13
 blake3>=0.4
 send2trash>=1.8
 open-clip-torch>=2.24
-ttkbootstrap>=1.12
-PySide6>=6.8

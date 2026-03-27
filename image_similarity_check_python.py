@@ -54,13 +54,32 @@ try:
 except Exception:
     _send2trash = None
 
+try:
+    import bootstrap
+except Exception:
+    bootstrap = None  # type: ignore
+
 APP_NAME = "图片相似度工作台"
 APP_VERSION = "2026 Desktop Studio Light · Compare Pro"
 VALID_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff", ".gif"}
-PIP_INDEX_CANDIDATES = [
+PIP_INDEX_CANDIDATES = [mirror["url"] for mirror in getattr(bootstrap, "PIP_MIRRORS", [])] or [
     "https://pypi.tuna.tsinghua.edu.cn/simple",
+    "https://mirrors.ustc.edu.cn/pypi/web/simple",
+    "https://mirrors.cloud.tencent.com/pypi/simple",
     "https://pypi.org/simple",
 ]
+REPO_ROOT = Path(__file__).resolve().parent
+LOCAL_MODEL_CANDIDATES = [
+    REPO_ROOT / "open_clip_model.safetensors",
+    REPO_ROOT / "open_clip_pytorch_model.bin",
+]
+MATCH_TYPE_LABELS = {
+    "exact_file": "文件完全一致",
+    "exact_pixels": "像素完全一致",
+    "near_duplicate": "高度相似",
+    "strong_match": "明显相似",
+    "possible_match": "可能相似",
+}
 
 StatusCallback = Optional[Callable[[str], None]]
 ProgressCallback = Optional[Callable[[int, int, str], None]]
@@ -84,7 +103,11 @@ class ImageRecord:
 
 
 def normalize_path(p: Path) -> str:
-    return str(p.expanduser().resolve())
+    return os.path.normcase(os.path.abspath(str(p.expanduser())))
+
+
+def absolute_path(p: Path) -> Path:
+    return Path(os.path.abspath(str(p.expanduser())))
 
 
 def clean_input_path(raw: str) -> str:
@@ -211,9 +234,9 @@ def list_images(root: Path, recursive: bool = True, extensions: Optional[set] = 
 
 def safe_relpath(path: Path, root: Path) -> str:
     try:
-        return str(path.resolve().relative_to(root.resolve()))
+        return str(absolute_path(path).relative_to(absolute_path(root)))
     except Exception:
-        return str(path.resolve())
+        return str(absolute_path(path))
 
 
 def all_pairs(indices: Sequence[int]) -> Iterable[Tuple[int, int]]:
@@ -243,11 +266,22 @@ def recommended_workers() -> int:
 def recommended_batch_size(device: str) -> int:
     if device == "cuda" and torch is not None and torch.cuda.is_available():
         try:
+            device_name = torch.cuda.get_device_name(0).lower()
             total_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-            return 64 if total_mem_gb >= 6 else 32
+            # Pascal-era laptop GPUs such as GTX 1070 are common in this project.
+            # A slightly smaller default batch avoids long first-run stalls and OOM risk.
+            if any(token in device_name for token in ("gtx 1060", "gtx 1070", "gtx 1080", "p10")):
+                return 12
+            if total_mem_gb >= 12:
+                return 32
+            if total_mem_gb >= 8:
+                return 16
+            if total_mem_gb >= 6:
+                return 12
+            return 12
         except Exception:
-            return 32
-    return 16
+            return 12
+    return 8
 
 
 def hardware_summary(device: str) -> str:
@@ -281,9 +315,9 @@ def resolve_clip_pretrained(pretrained: str) -> str:
     if candidate.exists() and candidate.is_file():
         return str(candidate.resolve())
 
-    default_local = Path("C:/MachineLearning/open_clip_pytorch_model.bin")
-    if default_local.exists() and default_local.is_file():
-        return str(default_local.resolve())
+    for local_candidate in LOCAL_MODEL_CANDIDATES:
+        if local_candidate.exists() and local_candidate.is_file():
+            return str(local_candidate.resolve())
     return pretrained
 
 
@@ -297,40 +331,10 @@ def install_runtime_dependencies(
 ) -> str:
     if not requirements_file.exists():
         raise FileNotFoundError(f"未找到依赖清单：{requirements_file}")
-    last_error = None
-    for index_url in PIP_INDEX_CANDIDATES:
-        emit_status(status_cb, f"正在安装依赖…\n源：{index_url}")
-        cmd = [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--upgrade",
-            "pip",
-        ]
-        try:
-            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        except Exception:
-            pass
-        cmd = [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "-r",
-            str(requirements_file),
-            "-i",
-            index_url,
-            "--prefer-binary",
-            "--disable-pip-version-check",
-        ]
-        try:
-            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            return index_url
-        except Exception as e:
-            last_error = e
-            emit_status(status_cb, f"依赖源安装失败，准备尝试下一源：{index_url}\n原因：{e}")
-    raise RuntimeError(f"依赖安装失败。已尝试源：{', '.join(PIP_INDEX_CANDIDATES)}；最后错误：{last_error}")
+    if bootstrap is None:
+        raise RuntimeError("安装模块不可用，无法执行依赖安装。")
+    emit_status(status_cb, "正在安装依赖，过程会实时显示。")
+    return bootstrap.install_dependencies(force=True)
 
 
 def get_hf_endpoint_candidates(mirror_mode: str = 'auto', custom_endpoint: str = '') -> List[str]:
@@ -369,6 +373,30 @@ def emit_progress(cb: ProgressCallback, current: int, total: int, stage: str) ->
         cb(current, total, stage)
 
 
+def run_with_status_heartbeat(
+    action: Callable[[], Tuple[object, object, object]],
+    *,
+    status_cb: StatusCallback,
+    waiting_message: str,
+    success_message: str,
+) -> Tuple[object, object, object]:
+    done = threading.Event()
+
+    def heartbeat() -> None:
+        waited_seconds = 0
+        while not done.wait(1.5):
+            waited_seconds += 2
+            emit_status(status_cb, f"{waiting_message}\n已等待约 {waited_seconds} 秒")
+
+    worker = threading.Thread(target=heartbeat, daemon=True)
+    worker.start()
+    try:
+        return action()
+    finally:
+        done.set()
+        emit_status(status_cb, success_message)
+
+
 def compute_openclip_embeddings(
     paths: List[str],
     model_name: str,
@@ -394,10 +422,15 @@ def compute_openclip_embeddings(
     previous_env = {}
     if Path(pretrained_spec).exists():
         emit_status(status_cb, f"正在加载本地 OpenCLIP 模型…\n{pretrained_spec}")
-        model, _, preprocess = open_clip.create_model_and_transforms(
-            model_name=model_name,
-            pretrained=pretrained_spec,
-            device=device,
+        model, _, preprocess = run_with_status_heartbeat(
+            lambda: open_clip.create_model_and_transforms(
+                model_name=model_name,
+                pretrained=pretrained_spec,
+                device=device,
+            ),
+            status_cb=status_cb,
+            waiting_message="正在加载本地模型，请稍候…",
+            success_message="本地模型加载完成。",
         )
     else:
         endpoints = get_hf_endpoint_candidates(mirror_mode=mirror_mode, custom_endpoint=custom_endpoint)
@@ -409,10 +442,15 @@ def compute_openclip_embeddings(
             chosen_endpoint = endpoint
             emit_status(status_cb, f"正在加载 OpenCLIP 模型…\n镜像/源：{endpoint}\n缓存目录：{env_updates['HF_HUB_CACHE']}")
             try:
-                model, _, preprocess = open_clip.create_model_and_transforms(
-                    model_name=model_name,
-                    pretrained=pretrained_spec,
-                    device=device,
+                model, _, preprocess = run_with_status_heartbeat(
+                    lambda: open_clip.create_model_and_transforms(
+                        model_name=model_name,
+                        pretrained=pretrained_spec,
+                        device=device,
+                    ),
+                    status_cb=status_cb,
+                    waiting_message=f"正在从 {endpoint} 获取模型，请稍候…",
+                    success_message=f"模型已从 {endpoint} 加载完成。",
                 )
                 last_error = None
                 break
@@ -817,6 +855,109 @@ def autosize_columns(ws, extra: int = 2, max_width: int = 60) -> None:
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
 
+def match_type_label(match_type: str) -> str:
+    return MATCH_TYPE_LABELS.get(match_type, match_type)
+
+
+def explain_match_reason(row: dict) -> str:
+    if row.get("same_file_hash"):
+        return "文件内容完全一致。"
+    if row.get("same_pixel_hash"):
+        return "像素内容完全一致。"
+    match_type = row.get("match_type", "")
+    if match_type == "near_duplicate":
+        return "综合特征、感知哈希和差异哈希都非常接近。"
+    if match_type == "strong_match":
+        return "综合特征接近，视觉内容大体相同。"
+    return "综合特征接近，建议人工复核。"
+
+
+def display_name_for_path(path: str) -> str:
+    return Path(path).name or path
+
+
+def display_size(num_bytes: int) -> str:
+    return human_size(int(num_bytes or 0))
+
+
+def describe_image_side(row: dict, prefix: str) -> str:
+    resolution = row.get(f"resolution_{prefix}", "") or "-"
+    size = display_size(row.get(f"file_size_{prefix}", 0))
+    return f"{resolution} | {size}"
+
+
+def export_match_rows(rows: List[dict]) -> List[dict]:
+    exported = []
+    for index, row in enumerate(rows, start=1):
+        deleted_side = row.get("deleted_side", "") or ""
+        exported.append(
+            {
+                "序号": index,
+                "相似度": row["similarity_score"],
+                "匹配判断": match_type_label(row.get("match_type", "")),
+                "匹配原因": explain_match_reason(row),
+                "图片 A": row.get("name_1", display_name_for_path(row["path_1"])),
+                "图片 B": row.get("name_2", display_name_for_path(row["path_2"])),
+                "A 信息": describe_image_side(row, "1"),
+                "B 信息": describe_image_side(row, "2"),
+                "A 路径": row["path_1"],
+                "B 路径": row["path_2"],
+                "A 相对路径": row.get("rel_path_1", ""),
+                "B 相对路径": row.get("rel_path_2", ""),
+                "状态": f"已删除 {deleted_side} 侧" if deleted_side else "",
+            }
+        )
+    return exported
+
+
+def write_unified_txt_report(
+    *,
+    output_txt: Path,
+    title: str,
+    summary_rows: List[Tuple[str, str]],
+    rows: List[dict],
+    left_label: str,
+    right_label: str,
+    errors_sections: List[Tuple[str, List[Tuple[str, str]]]],
+) -> None:
+    lines: List[str] = [title, "=" * 72]
+    lines.extend(f"{label}: {value}" for label, value in summary_rows)
+    lines.append("")
+
+    if rows:
+        lines.append("匹配结果")
+        lines.append("-" * 72)
+        for exported in export_match_rows(rows):
+            lines.append(f"[{exported['序号']:03d}] {exported['匹配判断']} | 相似度 {exported['相似度']:.4f}")
+            lines.append(f"  原因: {exported['匹配原因']}")
+            lines.append(f"  {left_label}: {exported['图片 A']} | {exported['A 信息']}")
+            lines.append(f"    路径: {exported['A 路径']}")
+            if exported["A 相对路径"]:
+                lines.append(f"    相对路径: {exported['A 相对路径']}")
+            lines.append(f"  {right_label}: {exported['图片 B']} | {exported['B 信息']}")
+            lines.append(f"    路径: {exported['B 路径']}")
+            if exported["B 相对路径"]:
+                lines.append(f"    相对路径: {exported['B 相对路径']}")
+            if exported["状态"]:
+                lines.append(f"  状态: {exported['状态']}")
+            lines.append("")
+    else:
+        lines.append("没有找到符合当前阈值的结果。")
+        lines.append("")
+
+    has_errors = any(items for _, items in errors_sections)
+    if has_errors:
+        lines.append("异常文件")
+        lines.append("-" * 72)
+        for section_title, items in errors_sections:
+            for path, err in items:
+                lines.append(f"{section_title}: {path}")
+                lines.append(f"  错误: {err}")
+        lines.append("")
+
+    output_txt.write_text("\n".join(lines), encoding="utf-8")
+
+
 def write_excel(
     output_xlsx: str,
     root_dir: str,
@@ -829,35 +970,30 @@ def write_excel(
 ) -> None:
     wb = Workbook()
     ws_summary = wb.active
-    ws_summary.title = "summary"
-    ws_matches = wb.create_sheet("matches")
-    ws_errors = wb.create_sheet("errors")
+    ws_summary.title = "摘要"
+    ws_matches = wb.create_sheet("匹配结果")
+    ws_errors = wb.create_sheet("异常文件")
 
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(color="FFFFFF", bold=True)
     thin_gray = Side(style="thin", color="B7B7B7")
-    border = Border(bottom=thin_gray)
+    border = Border(left=thin_gray, right=thin_gray, top=thin_gray, bottom=thin_gray)
 
-    ws_summary["A1"] = "Image Similarity Report"
-    ws_summary["A1"].font = Font(size=14, bold=True)
+    ws_summary["A1"] = "图片相似结果"
+    ws_summary["A1"].font = Font(size=15, bold=True)
 
     summary_rows = [
-        ("root_dir", root_dir),
-        ("images_scanned", len(records)),
-        ("valid_images", sum(1 for r in records if r.error is None)),
-        ("errored_images", sum(1 for r in records if r.error is not None)),
-        ("min_similarity", min_sim),
-        ("max_similarity", max_sim),
-        ("top_k_neighbors", top_k),
-        ("match_rows", '=COUNTA(matches!A:A)-1'),
-        ("exact_file_rows", '=COUNTIF(matches!E:E,"exact_file")'),
-        ("exact_pixels_rows", '=COUNTIF(matches!E:E,"exact_pixels")'),
-        ("near_duplicate_rows", '=COUNTIF(matches!E:E,"near_duplicate")'),
-        ("strong_match_rows", '=COUNTIF(matches!E:E,"strong_match")'),
-        ("possible_match_rows", '=COUNTIF(matches!E:E,"possible_match")'),
+        ("扫描目录", root_dir),
+        ("扫描图片数", len(records)),
+        ("有效图片数", sum(1 for r in records if r.error is None)),
+        ("异常文件数", sum(1 for r in records if r.error is not None)),
+        ("最低相似度", f"{min_sim:.2f}"),
+        ("最高相似度", f"{max_sim:.2f}"),
+        ("每张图片保留", top_k),
+        ("匹配结果数", len(rows)),
     ]
-    ws_summary["A3"] = "metric"
-    ws_summary["B3"] = "value"
+    ws_summary["A3"] = "项目"
+    ws_summary["B3"] = "值"
     for c in ("A3", "B3"):
         ws_summary[c].fill = header_fill
         ws_summary[c].font = header_font
@@ -868,11 +1004,12 @@ def write_excel(
     ws_summary.freeze_panes = "A4"
     autosize_columns(ws_summary)
 
+    exported_rows = export_match_rows(rows)
     headers = [
-        "path_1", "path_2", "rel_path_1", "rel_path_2", "match_type",
-        "same_file_hash", "same_pixel_hash", "file_size_1", "file_size_2",
-        "resolution_1", "resolution_2", "embedding_backend", "embedding_similarity",
-        "phash_similarity", "dhash_similarity", "similarity_score", "reason",
+        "序号", "相似度", "匹配判断", "匹配原因",
+        "图片 A", "A 信息", "A 路径",
+        "图片 B", "B 信息", "B 路径",
+        "状态",
     ]
     for col, h in enumerate(headers, start=1):
         cell = ws_matches.cell(row=1, column=col, value=h)
@@ -880,14 +1017,14 @@ def write_excel(
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    for row_idx, row in enumerate(rows, start=2):
+    for row_idx, row in enumerate(exported_rows, start=2):
         for col_idx, h in enumerate(headers, start=1):
             val = row[h]
             cell = ws_matches.cell(row=row_idx, column=col_idx, value=val)
             cell.border = border
-            if h in {"embedding_similarity", "phash_similarity", "dhash_similarity", "similarity_score"}:
+            if h in {"相似度"}:
                 cell.number_format = "0.0000"
-            if h in {"path_1", "path_2"}:
+            if h in {"A 路径", "B 路径"}:
                 p = Path(str(val))
                 if p.exists():
                     cell.hyperlink = p.as_uri()
@@ -897,8 +1034,8 @@ def write_excel(
     ws_matches.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{max(2, len(rows) + 1)}"
     autosize_columns(ws_matches, extra=3, max_width=90)
 
-    ws_errors["A1"] = "path"
-    ws_errors["B1"] = "error"
+    ws_errors["A1"] = "路径"
+    ws_errors["B1"] = "错误"
     for c in ("A1", "B1"):
         ws_errors[c].fill = header_fill
         ws_errors[c].font = header_font
@@ -925,49 +1062,25 @@ def write_reference_txt_report(
     max_sim: float,
     recursive: bool,
 ) -> None:
-    lines: List[str] = []
-    lines.append("图片相似检索报告")
-    lines.append("=" * 72)
-    lines.append(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    lines.append(f"参考图片: {reference_path}")
-    lines.append(f"搜索目录: {search_dir}")
-    lines.append(f"递归扫描: {'是' if recursive else '否'}")
-    lines.append(f"扫描图片数: {scanned_count}")
-    lines.append(f"有效图片数: {valid_count}")
-    lines.append(f"异常文件数: {len(errors)}")
-    lines.append(f"相似度区间: {min_sim:.2f} ~ {max_sim:.2f}")
-    lines.append(f"匹配结果数: {len(rows)}")
-    lines.append("")
-
-    if rows:
-        lines.append("匹配结果")
-        lines.append("-" * 72)
-        for i, row in enumerate(rows, start=1):
-            lines.append(f"[{i:03d}] 相似度 {row['similarity_score']:.4f} | 类型 {row['match_type']}")
-            lines.append(f"      路径: {row['path_2']}")
-            lines.append(f"      相对路径: {row['rel_path_2']}")
-            lines.append(f"      分辨率: {row['resolution_2']} | 文件大小: {row['file_size_2']} bytes")
-            lines.append(
-                "      子分数: "
-                f"embedding={row['embedding_similarity']:.4f}, "
-                f"phash={row['phash_similarity']:.4f}, "
-                f"dhash={row['dhash_similarity']:.4f}"
-            )
-            lines.append(f"      后端: {row['embedding_backend']} | 原因: {row['reason']}")
-            lines.append("")
-    else:
-        lines.append("未找到符合相似度阈值的图片。")
-        lines.append("")
-
-    if errors:
-        lines.append("异常文件")
-        lines.append("-" * 72)
-        for path, err in errors:
-            lines.append(f"- {path}")
-            lines.append(f"  错误: {err}")
-        lines.append("")
-
-    output_txt.write_text("\n".join(lines), encoding="utf-8")
+    write_unified_txt_report(
+        output_txt=output_txt,
+        title="参考图检索报告",
+        summary_rows=[
+            ("生成时间", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            ("参考图片", str(reference_path)),
+            ("搜索目录", str(search_dir)),
+            ("递归扫描", "是" if recursive else "否"),
+            ("扫描图片数", str(scanned_count)),
+            ("有效图片数", str(valid_count)),
+            ("异常文件数", str(len(errors))),
+            ("相似度区间", f"{min_sim:.2f} ~ {max_sim:.2f}"),
+            ("匹配结果数", str(len(rows))),
+        ],
+        rows=rows,
+        left_label="参考图",
+        right_label="命中图",
+        errors_sections=[("异常文件", errors)],
+    )
 
 
 def human_size(num_bytes: int) -> str:
@@ -1111,36 +1224,21 @@ def write_cross_compare_txt_report(
     min_sim: float,
     max_sim: float,
 ) -> None:
-    lines: List[str] = []
-    lines.append("双目录图片相似对比报告")
-    lines.append("=" * 72)
-    lines.append(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    lines.append(f"目录 A: {dir_a}")
-    lines.append(f"目录 B: {dir_b}")
-    lines.append(f"相似度区间: {min_sim:.2f} ~ {max_sim:.2f}")
-    lines.append(f"匹配结果数: {len(rows)}")
-    lines.append("")
-    for i, row in enumerate(rows, start=1):
-        lines.append(f"[{i:03d}] {row['similarity_score']:.4f} | {row['match_type']} | 删除状态: {row.get('deleted_side', '') or '未删除'}")
-        lines.append(f"  A: {row['path_1']} | {row['resolution_1']} | {human_size(row['file_size_1'])}")
-        lines.append(f"  B: {row['path_2']} | {row['resolution_2']} | {human_size(row['file_size_2'])}")
-        lines.append(
-            "  子分数: "
-            f"embedding={row['embedding_similarity']:.4f}, "
-            f"phash={row['phash_similarity']:.4f}, "
-            f"dhash={row['dhash_similarity']:.4f}"
-        )
-        lines.append("")
-    if errors_a or errors_b:
-        lines.append("异常文件")
-        lines.append("-" * 72)
-        for path, err in errors_a:
-            lines.append(f"A | {path}")
-            lines.append(f"  错误: {err}")
-        for path, err in errors_b:
-            lines.append(f"B | {path}")
-            lines.append(f"  错误: {err}")
-    output_txt.write_text("\n".join(lines), encoding="utf-8")
+    write_unified_txt_report(
+        output_txt=output_txt,
+        title="双目录复核报告",
+        summary_rows=[
+            ("生成时间", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            ("目录 A", str(dir_a)),
+            ("目录 B", str(dir_b)),
+            ("相似度区间", f"{min_sim:.2f} ~ {max_sim:.2f}"),
+            ("匹配结果数", str(len(rows))),
+        ],
+        rows=rows,
+        left_label="目录 A",
+        right_label="目录 B",
+        errors_sections=[("目录 A 异常", errors_a), ("目录 B 异常", errors_b)],
+    )
 
 
 def normalize_common_args(args: argparse.Namespace) -> argparse.Namespace:
@@ -1167,8 +1265,8 @@ def run_scan_job(args: argparse.Namespace, status_cb: StatusCallback = None, pro
     total_start = time.perf_counter()
     args = normalize_common_args(args)
 
-    input_dir = Path(clean_input_path(args.input_dir)).expanduser().resolve()
-    output_xlsx = Path(clean_input_path(args.output_xlsx)).expanduser().resolve() if args.output_xlsx else make_default_output_path(input_dir)
+    input_dir = absolute_path(Path(clean_input_path(args.input_dir)))
+    output_xlsx = absolute_path(Path(clean_input_path(args.output_xlsx))) if args.output_xlsx else make_default_output_path(input_dir)
     if output_xlsx.suffix.lower() != ".xlsx":
         output_xlsx = output_xlsx.with_suffix(".xlsx")
     if not input_dir.exists() or not input_dir.is_dir():
@@ -1236,9 +1334,9 @@ def run_reference_job(args: argparse.Namespace, status_cb: StatusCallback = None
     total_start = time.perf_counter()
     args = normalize_common_args(args)
 
-    reference_image = Path(clean_input_path(args.reference_image)).expanduser().resolve()
-    search_dir = Path(clean_input_path(args.search_dir)).expanduser().resolve()
-    output_txt = Path(clean_input_path(args.output_txt)).expanduser().resolve() if args.output_txt else make_default_txt_report_path(search_dir, reference_image)
+    reference_image = absolute_path(Path(clean_input_path(args.reference_image)))
+    search_dir = absolute_path(Path(clean_input_path(args.search_dir)))
+    output_txt = absolute_path(Path(clean_input_path(args.output_txt))) if args.output_txt else make_default_txt_report_path(search_dir, reference_image)
     if output_txt.suffix.lower() != ".txt":
         output_txt = output_txt.with_suffix(".txt")
     if not reference_image.exists() or not reference_image.is_file():
@@ -1321,12 +1419,14 @@ def run_ab_compare_job(args: argparse.Namespace, status_cb: StatusCallback = Non
     total_start = time.perf_counter()
     args = normalize_common_args(args)
 
-    dir_a = Path(clean_input_path(args.dir_a)).expanduser().resolve()
-    dir_b = Path(clean_input_path(args.dir_b)).expanduser().resolve()
+    dir_a = absolute_path(Path(clean_input_path(args.dir_a)))
+    dir_b = absolute_path(Path(clean_input_path(args.dir_b)))
     if not dir_a.exists() or not dir_a.is_dir():
         raise ValueError(f"目录 A 不存在或不是目录: {dir_a}")
     if not dir_b.exists() or not dir_b.is_dir():
         raise ValueError(f"目录 B 不存在或不是目录: {dir_b}")
+    if dir_a == dir_b:
+        raise ValueError("目录 A 和目录 B 不能是同一个目录。")
 
     min_sim = float(args.min_sim)
     max_sim = float(args.max_sim)
@@ -1423,6 +1523,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def launch_gui_mode(base_args: argparse.Namespace) -> None:
+    from desktop_ui import launch_app
+
+    launch_app()
+    return
+
     try:
         import tkinter as tk
         from tkinter import filedialog, messagebox, ttk
@@ -3222,8 +3327,9 @@ def launch_gui_mode(base_args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    args = parse_args()
-    launch_gui_mode(args)
+    from desktop_ui import launch_app
+
+    launch_app()
 
 
 if __name__ == "__main__":

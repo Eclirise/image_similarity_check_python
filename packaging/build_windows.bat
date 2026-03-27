@@ -2,15 +2,29 @@
 setlocal
 cd /d "%~dp0\.."
 
-if not exist ".venv\Scripts\python.exe" (
-  py -3 -m venv .venv
+call install_dependencies.bat
+if errorlevel 1 exit /b 1
+
+if exist ".venv\Scripts\python.exe" (
+  set "PY=.venv\Scripts\python.exe"
+) else (
+  echo Virtual environment Python was not found.
+  pause
+  exit /b 1
 )
 
-set "PY=.venv\Scripts\python.exe"
-"%PY%" -m pip install --upgrade pip
-"%PY%" -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --prefer-binary || "%PY%" -m pip install -r requirements.txt -i https://pypi.org/simple --prefer-binary
-"%PY%" -m pip install pyinstaller -i https://pypi.tuna.tsinghua.edu.cn/simple || "%PY%" -m pip install pyinstaller -i https://pypi.org/simple
-"%PY%" -m PyInstaller --noconfirm --noconsole --name ImageSimilarityStudio app/main.py
+"%PY%" -m pip install pyinstaller -i https://pypi.tuna.tsinghua.edu.cn/simple --disable-pip-version-check
+if errorlevel 1 "%PY%" -m pip install pyinstaller -i https://mirrors.ustc.edu.cn/pypi/web/simple --disable-pip-version-check
+if errorlevel 1 "%PY%" -m pip install pyinstaller -i https://mirrors.cloud.tencent.com/pypi/simple --disable-pip-version-check
+if errorlevel 1 "%PY%" -m pip install pyinstaller -i https://pypi.org/simple --disable-pip-version-check
+if errorlevel 1 (
+  echo PyInstaller install failed.
+  pause
+  exit /b 1
+)
 
-echo 打包完成：dist\ImageSimilarityStudio\ImageSimilarityStudio.exe
+"%PY%" -m PyInstaller --noconfirm --noconsole --name ImageSimilarityStudio run.py
+
+echo.
+echo Build finished: dist\ImageSimilarityStudio\ImageSimilarityStudio.exe
 endlocal
