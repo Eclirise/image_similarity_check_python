@@ -25,6 +25,7 @@ from image_similarity_check_python import (
     run_ab_compare_job,
     run_reference_job,
     run_scan_job,
+    run_single_directory_compare_job,
     write_cross_compare_txt_report,
 )
 
@@ -412,6 +413,7 @@ class ModernStudioApp:
         self.scan_result_var = tk.StringVar(value="请选择目录后开始。")
         self.reference_result_var = tk.StringVar(value="请选择参考图与目录后开始。")
         self.compare_result_var = tk.StringVar(value="请选择目录 A 和目录 B。")
+        self.single_compare_result_var = tk.StringVar(value="请选择目录后开始。")
         self.compare_recommend_var = tk.StringVar(value="系统会在这里给出删图建议。")
         self.compare_left_var = tk.StringVar(value="等待结果")
         self.compare_right_var = tk.StringVar(value="等待结果")
@@ -445,6 +447,7 @@ class ModernStudioApp:
         self.page_frames["scan"] = self._build_scan_page()
         self.page_frames["reference"] = self._build_reference_page()
         self.page_frames["compare"] = self._build_compare_page()
+        self.page_frames["single_compare"] = self._build_single_compare_page()
 
     def _build_header(self, parent: tk.Widget) -> None:
         header = tk.Frame(parent, bg=BG)
@@ -474,6 +477,7 @@ class ModernStudioApp:
         self.mode_buttons["scan"] = FlatButton(bar, text="目录扫描", command=lambda: self._show_mode("scan"))
         self.mode_buttons["reference"] = FlatButton(bar, text="参考图检索", command=lambda: self._show_mode("reference"))
         self.mode_buttons["compare"] = FlatButton(bar, text="双目录复核", command=lambda: self._show_mode("compare"))
+        self.mode_buttons["single_compare"] = FlatButton(bar, text="单目录复核", command=lambda: self._show_mode("single_compare"))
         for button in self.mode_buttons.values():
             button.pack(side="left", padx=(0, 12))
 
@@ -879,6 +883,40 @@ class ModernStudioApp:
         self.action_buttons.extend([keep_button, recommend_button, delete_left_button, delete_right_button, open_left_button, open_right_button])
         return page
 
+    def _build_single_compare_page(self) -> tk.Frame:
+        page, content = self._base_page("单目录复核", "在同一目录内查找相似图，逐组确认保留或删除。")
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_columnconfigure(1, weight=1)
+        content.grid_rowconfigure(0, weight=1)
+        content.grid_rowconfigure(1, weight=2)
+
+        outer, top_card = self._card(content)
+        outer.grid(row=0, column=0, columnspan=2, sticky="nsew", pady=(0, 12))
+        self.single_compare_dir = InputField(top_card, "图片目录", browse_kind="dir")
+        self.single_compare_dir.pack(fill="x")
+        FlatButton(top_card, text="更多设置", quiet=True, command=lambda: self._toggle_frame(self.single_compare_advanced)).pack(anchor="w", pady=(12, 0))
+        self.single_compare_advanced = self._advanced_frame(top_card)
+        self.single_compare_min, self.single_compare_max = self._range_inputs(self.single_compare_advanced, "0.92", "1.00")
+        self.single_compare_topk = self._single_small_field(self.single_compare_advanced, "每张图保留", "3")
+        self.single_compare_recursive = tk.BooleanVar(value=True)
+        self.single_compare_high_precision = tk.BooleanVar(value=True)
+        self._check_row(self.single_compare_advanced, self.single_compare_recursive, "扫描子目录").pack(anchor="w", pady=(14, 0))
+        self._check_row(self.single_compare_advanced, self.single_compare_high_precision, "使用高精度模型").pack(anchor="w", pady=(8, 0))
+
+        actions = tk.Frame(top_card, bg=SURFACE)
+        actions.pack(fill="x", pady=(18, 0))
+        start_button = FlatButton(actions, text="开始复核", primary=True, command=self._start_single_compare)
+        start_button.pack(side="left")
+        self.action_buttons.append(start_button)
+
+        outer, result = self._card(content)
+        outer.grid(row=1, column=0, columnspan=2, sticky="nsew")
+        tk.Label(result, text="当前状态", bg=SURFACE, fg=MUTED, font=_font(11)).pack(anchor="w")
+        tk.Label(result, textvariable=self.single_compare_result_var, bg=SURFACE, fg=TEXT, font=_font(14), justify="left", wraplength=1120).pack(anchor="w", pady=(8, 0))
+        tk.Label(result, text="下方会同步显示与双目录复核一致的结果列表和删图操作。", bg=SURFACE, fg=MUTED, font=_font(11), justify="left", wraplength=1120).pack(anchor="w", pady=(8, 0))
+        FlatButton(result, text="切到双目录复核查看列表", quiet=True, command=lambda: self._show_mode("compare")).pack(anchor="w", pady=(12, 0))
+        return page
+
     def _start_scan(self) -> None:
         input_dir = self.scan_dir.get()
         if not input_dir:
@@ -989,6 +1027,48 @@ class ModernStudioApp:
             else:
                 self.compare_result_var.set("没有符合阈值的结果。")
                 self.compare_recommend_var.set("可以调低阈值后再试。")
+
+        self._start_worker(worker, done)
+
+    def _start_single_compare(self) -> None:
+        input_dir = self.single_compare_dir.get()
+        if not input_dir:
+            messagebox.showinfo("请补全路径", "请先选择图片目录。")
+            return
+        min_sim = self._read_float_value(self.single_compare_min.get(), "最低相似度", minimum=0.0, maximum=1.0)
+        max_sim = self._read_float_value(self.single_compare_max.get(), "最高相似度", minimum=0.0, maximum=1.0)
+        top_k = self._read_int_value(self.single_compare_topk.get().strip() or "3", "每张图保留", minimum=1, maximum=100)
+        if min_sim is None or max_sim is None or top_k is None:
+            return
+        if min_sim > max_sim:
+            messagebox.showwarning("输入有误", "最低相似度不能高于最高相似度。")
+            return
+        args = self._task_args(
+            high_precision=self.single_compare_high_precision.get(),
+            input_dir=input_dir,
+            min_sim=min_sim,
+            max_sim=max_sim,
+            top_k=top_k,
+            non_recursive=not self.single_compare_recursive.get(),
+        )
+        self.single_compare_result_var.set("正在复核，请稍候。")
+
+        def worker(status_cb, progress_cb):
+            return run_single_directory_compare_job(args, status_cb=status_cb, progress_cb=progress_cb)
+
+        def done(result: dict) -> None:
+            self.compare_meta = result
+            self.compare_rows = list(result["rows"])
+            self._reload_compare_table()
+            self.model_var.set(self._model_summary())
+            if self.compare_rows:
+                self._select_compare_index(0)
+                self.single_compare_result_var.set(f"已找到 {len(self.compare_rows)} 组候选，请在“双目录复核”页执行删图。")
+                self.compare_result_var.set("单目录结果已加载，可直接复核。")
+                self._show_mode("compare")
+                self._open_large_compare()
+            else:
+                self.single_compare_result_var.set("没有符合阈值的结果。")
 
         self._start_worker(worker, done)
 
@@ -1242,7 +1322,7 @@ class ModernStudioApp:
         self.root.bind("<Key-v>", lambda _event: self._compare_shortcut(self._open_large_compare))
 
     def _compare_shortcut(self, callback) -> None:
-        if self.current_mode != "compare" or self.job_running:
+        if self.current_mode not in {"compare", "single_compare"} or self.job_running:
             return
         callback()
 

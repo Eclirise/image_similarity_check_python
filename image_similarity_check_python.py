@@ -1505,6 +1505,79 @@ def run_ab_compare_job(args: argparse.Namespace, status_cb: StatusCallback = Non
     }
 
 
+def run_single_directory_compare_job(args: argparse.Namespace, status_cb: StatusCallback = None, progress_cb: ProgressCallback = None) -> dict:
+    total_start = time.perf_counter()
+    args = normalize_common_args(args)
+
+    input_dir = absolute_path(Path(clean_input_path(args.input_dir)))
+    if not input_dir.exists() or not input_dir.is_dir():
+        raise ValueError(f"目录不存在或不是目录: {input_dir}")
+
+    min_sim = float(args.min_sim)
+    max_sim = float(args.max_sim)
+    validate_similarity_range(min_sim, max_sim)
+
+    device = guess_device(args.device)
+    workers = args.workers
+    batch_size = args.batch_size
+    use_openclip = not args.no_openclip
+    top_k = getattr(args, "top_k", None) or 3
+    extensions = {("." + x.strip().lower().lstrip(".")) for x in args.extensions.split(",") if x.strip()}
+
+    emit_status(status_cb, hardware_summary(device))
+    files = list_images(input_dir, recursive=not args.non_recursive, extensions=extensions)
+    if not files:
+        raise ValueError("目录中没有找到图片文件。")
+    emit_status(status_cb, f"已找到 {len(files)} 张图片。")
+
+    emit_status(status_cb, "正在分析目录…")
+    records, errors = build_records(
+        files=files,
+        root=input_dir,
+        workers=workers,
+        use_openclip=use_openclip,
+        clip_model=args.clip_model,
+        clip_pretrained=args.clip_pretrained,
+        batch_size=batch_size,
+        device=device,
+        clip_mirror=getattr(args, "clip_mirror", "auto"),
+        clip_endpoint=getattr(args, "clip_endpoint", ""),
+        model_cache_dir=getattr(args, "model_cache_dir", None),
+        status_cb=status_cb,
+        progress_cb=progress_cb,
+    )
+    rows = build_results(
+        records=records,
+        min_sim=min_sim,
+        max_sim=max_sim,
+        top_k=top_k,
+        status_cb=status_cb,
+        progress_cb=progress_cb,
+    )
+
+    for row in rows:
+        row["folder_1"] = str(Path(row["path_1"]).parent)
+        row["folder_2"] = str(Path(row["path_2"]).parent)
+        row["name_1"] = Path(row["path_1"]).name
+        row["name_2"] = Path(row["path_2"]).name
+        row["deleted_side"] = row.get("deleted_side", "")
+
+    total_elapsed = time.perf_counter() - total_start
+    emit_progress(progress_cb, 1, 1, "已完成")
+    return {
+        "rows": rows,
+        "records_a": records,
+        "records_b": records,
+        "errors_a": errors,
+        "errors_b": errors,
+        "dir_a": str(input_dir),
+        "dir_b": str(input_dir),
+        "elapsed": total_elapsed,
+        "min_sim": min_sim,
+        "max_sim": max_sim,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="图片相似度桌面工作台")
     parser.add_argument("--mode", default="gui", help="兼容旧参数；此版本固定启动图形界面")
